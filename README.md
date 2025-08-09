@@ -19,7 +19,7 @@ This project demonstrates advanced DLL injection techniques in processes using m
 ```bash
 # Clone the repository
 git clone https://github.com/KingTimer12/demoncore-mapping.git
-cd mapping-injection
+cd demoncore-mapping
 
 # Build the project
 cargo build --release --workspace
