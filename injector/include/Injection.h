@@ -5,6 +5,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <cstdio>
+#include <memory>
 
 using f_LoadLibraryA = HINSTANCE(WINAPI*)(const char* lpLibFileName);
 using f_GetProcAddress = UINT_PTR(WINAPI*)(HINSTANCE hModule,
@@ -18,4 +20,4 @@ struct MANUAL_MAPPING_DATA {
   HINSTANCE hModule;
 };
 
-bool ManualMap(HANDLE hProcess, const char* szDllFile);
+bool ManualMap(HANDLE hProcess, const char* dllData, size_t dllSize);

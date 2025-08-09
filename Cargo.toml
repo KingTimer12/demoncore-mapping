@@ -3,13 +3,30 @@ name = "mapping-injection"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+resolver = "3"
+members = ["crates/example-dll"]
+
 [dependencies]
 anyhow = "1.0.98"
 autocxx = "0.30.0"
 cxx = { version = "1.0.165", features = ["c++17"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60.2" , features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_Security"] }
+windows-sys = { version = "0.60.2", features = [
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_Media",
+    "Win32_Media_KernelStreaming",
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+] }
 
 [build-dependencies]
 winres = "0.1"

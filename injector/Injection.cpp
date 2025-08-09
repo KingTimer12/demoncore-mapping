@@ -1,252 +1,378 @@
 #include "include/Injection.h"
 
-void __stdcall shell_code(MANUAL_MAPPING_DATA* data_ptr);
-
-bool ManualMap(HANDLE hProcess, const char* szDllFile) {
-  BYTE* src_data_ptr = nullptr;
-  IMAGE_NT_HEADERS* old_nt_headers_ptr = nullptr;
-  IMAGE_OPTIONAL_HEADER* old_optional_header_ptr = nullptr;
-  IMAGE_FILE_HEADER* old_file_header_ptr = nullptr;
-  BYTE* dest_data_ptr = nullptr;  // target_base
-
-  DWORD dw_check = 0;
-  if (GetFileAttributesA(szDllFile) == INVALID_FILE_ATTRIBUTES) {
-    printf("File %s doesn't exist.\n", szDllFile);
-    return false;
-  }
-
-  std::ifstream file(szDllFile, std::ios::binary | std::ios::ate);
-  if (file.fail()) {
-    printf("Failed to open file %s. Failed: %X\n", szDllFile,
-           (DWORD)file.rdstate());
-    file.close();
-    return false;
-  }
-
-  auto file_size = file.tellg();
-  if (file_size < 0x1000) {
-    printf("File %s is too small.\n", szDllFile);
-    file.close();
-    return false;
-  }
-
-  src_data_ptr = new BYTE[static_cast<UINT_PTR>(file_size)];
-  if (!src_data_ptr) {
-    printf("Failed to allocate memory for file %s.\n", szDllFile);
-    file.close();
-    return false;
-  }
-
-  file.seekg(0, std::ios::beg);
-  file.read(reinterpret_cast<char*>(src_data_ptr), file_size);
-  file.close();
-
-  // https://en.wikipedia.org/wiki/DOS_MZ_executable
-  if (reinterpret_cast<IMAGE_DOS_HEADER*>(src_data_ptr)->e_magic !=
-      IMAGE_DOS_SIGNATURE) {
-    printf("File %s is not a valid PE file.\n", szDllFile);
-    delete[] src_data_ptr;
-    return false;
-  }
-
-  old_nt_headers_ptr = reinterpret_cast<IMAGE_NT_HEADERS*>(
-      src_data_ptr +
-      reinterpret_cast<IMAGE_DOS_HEADER*>(src_data_ptr)->e_lfanew);
-
-  old_optional_header_ptr = &old_nt_headers_ptr->OptionalHeader;
-  old_file_header_ptr = &old_nt_headers_ptr->FileHeader;
-
+// Macro to determine relocation type based on architecture
 #ifdef _WIN64
-  if (old_file_header_ptr->Machine != IMAGE_FILE_MACHINE_AMD64) {
-    printf("File %s is not a valid PE file for x86-64 architecture.\n",
-           szDllFile);
-    delete[] src_data_ptr;
-    return false;
-  }
+#define RELOC_FLAG(RelInfo) (((RelInfo) >> 0x0C) == IMAGE_REL_BASED_DIR64)
 #else
-  if (old_file_header_ptr->Machine != IMAGE_FILE_MACHINE_I386) {
-    printf("File %s is not a valid PE file for x86 architecture.\n", szDllFile);
-    delete[] src_data_ptr;
-    return false;
-  }
+#define RELOC_FLAG(RelInfo) (((RelInfo) >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
 #endif
 
-  dest_data_ptr = reinterpret_cast<BYTE*>(VirtualAllocEx(
-      hProcess, reinterpret_cast<void*>(old_optional_header_ptr->ImageBase),
-      old_optional_header_ptr->SizeOfImage, MEM_COMMIT | MEM_RESERVE,
-      PAGE_EXECUTE_READWRITE));
-  if (!dest_data_ptr) {
-    dest_data_ptr = reinterpret_cast<BYTE*>(
-        VirtualAllocEx(hProcess, nullptr, old_optional_header_ptr->SizeOfImage,
-                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!dest_data_ptr) {
-      printf("VirtualAllocEx failed. Error: %X\n", GetLastError());
-      delete[] src_data_ptr;
-      return false;
-    }
-  }
+void __stdcall shell_code(MANUAL_MAPPING_DATA* data_ptr);
 
-  MANUAL_MAPPING_DATA data{0};
-  data.pLoadLibraryA = LoadLibraryA;
-  data.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
-  auto* section_header_ptr = IMAGE_FIRST_SECTION(old_nt_headers_ptr);
-  for (UINT i = 0; i < old_nt_headers_ptr->FileHeader.NumberOfSections;
-       i++, section_header_ptr++) {
-    if (section_header_ptr->SizeOfRawData == 0) continue;
-    if (!WriteProcessMemory(hProcess,
-                            dest_data_ptr + section_header_ptr->VirtualAddress,
-                            src_data_ptr + section_header_ptr->PointerToRawData,
-                            section_header_ptr->SizeOfRawData, nullptr)) {
-      printf("Can't map section %s. Error: %X\n", section_header_ptr->Name,
-             GetLastError());
-      delete[] src_data_ptr;
-      VirtualFreeEx(hProcess, dest_data_ptr, 0, MEM_RELEASE);
-      return false;
-    }
-  }
+// Forward declarations for helper functions
+bool ValidateFileExistence(const char* szDllFile);
+std::unique_ptr<BYTE[]> ReadFileToBuffer(const char* szDllFile,
+                                         std::streamsize& fileSize);
+bool ValidatePEHeaders(BYTE* pFileData);
+BYTE* AllocateTargetMemory(HANDLE hProcess, IMAGE_OPTIONAL_HEADER* pOptHeader);
+bool MapSectionsToTarget(HANDLE hProcess, BYTE* pTargetBase, BYTE* pFileData,
+                         IMAGE_NT_HEADERS* pOldNtHeader);
+bool ExecuteRemoteShellcode(HANDLE hProcess, BYTE* pTargetBase);
 
-  memcpy(src_data_ptr, &data, sizeof(data));
-  WriteProcessMemory(hProcess, dest_data_ptr, src_data_ptr, 0x1000, nullptr);
+// Forward declarations for shellcode helper functions
+void ApplyRelocations(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader,
+                      BYTE* pLocationDelta);
+void ResolveImports(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader,
+                    f_LoadLibraryA pLoadLibraryA,
+                    f_GetProcAddress pGetProcAddress);
+void ExecuteTLSCallbacks(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader);
 
-  delete[] src_data_ptr;
+/// @brief Manually maps a DLL into a target process
+/// @param hProcess Handle to the target process
+/// @param szDllFile Path to the DLL file
+/// @return True on success, false on failure
+bool ManualMap(HANDLE hProcess, const char* dllData, size_t dllSize) {
+  BYTE* src_data_ptr = new BYTE[static_cast<UINT_PTR>(dllSize)];
 
-  void* shellcode_ptr =
-      VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
-                     PAGE_EXECUTE_READWRITE);
-  if (!shellcode_ptr) {
-    printf("VirtualAllocEx for shellcode failed. Error: %X\n", GetLastError());
-    VirtualFreeEx(hProcess, dest_data_ptr, 0, MEM_RELEASE);
+  ::memcpy(src_data_ptr, dllData, dllSize);
+
+  // Step 3: Validate PE headers
+  if (!ValidatePEHeaders(src_data_ptr)) {
     return false;
   }
 
-  WriteProcessMemory(hProcess, shellcode_ptr,
-                     reinterpret_cast<void*>(shell_code), 0x1000, nullptr);
+  // Get PE headers from file data
+  IMAGE_DOS_HEADER* pDosHeader =
+      reinterpret_cast<IMAGE_DOS_HEADER*>(src_data_ptr);
+  IMAGE_NT_HEADERS* pOldNtHeader =
+      reinterpret_cast<IMAGE_NT_HEADERS*>(src_data_ptr + pDosHeader->e_lfanew);
+  IMAGE_OPTIONAL_HEADER* pOptHeader = &pOldNtHeader->OptionalHeader;
 
-  HANDLE h_thread = CreateRemoteThread(
-      hProcess, nullptr, 0,
-      reinterpret_cast<LPTHREAD_START_ROUTINE>(shellcode_ptr), dest_data_ptr, 0,
-      nullptr);
-  if (!h_thread) {
-    printf("CreateRemoteThread failed. Error: %X\n", GetLastError());
-    VirtualFreeEx(hProcess, shellcode_ptr, 0, MEM_RELEASE);
-    VirtualFreeEx(hProcess, dest_data_ptr, 0, MEM_RELEASE);
+  // Step 4: Allocate memory in target process
+  BYTE* pTargetBase = AllocateTargetMemory(hProcess, pOptHeader);
+  if (!pTargetBase) {
     return false;
   }
 
-  CloseHandle(h_thread);
-
-  HINSTANCE h_check = NULL;
-  while (!h_check) {
-    MANUAL_MAPPING_DATA data_checked{0};
-    ReadProcessMemory(hProcess, dest_data_ptr, &data_checked, sizeof(data_checked),
-                      nullptr);
-    h_check = data_checked.hModule;
-    Sleep(10);
+  // Step 5: Map DLL sections to target process
+  if (!MapSectionsToTarget(hProcess, pTargetBase, src_data_ptr, pOldNtHeader)) {
+    VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+    return false;
   }
 
-  VirtualFreeEx(hProcess, shellcode_ptr, 0, MEM_RELEASE);
+  // Step 6: Execute shellcode in remote process
+  if (!ExecuteRemoteShellcode(hProcess, pTargetBase)) {
+    VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+    return false;
+  }
+
+  // Cleanup and return success
+  VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Helper function implementations
+//-----------------------------------------------------------------------------
+
+/// @brief Checks if target file exists
+bool ValidateFileExistence(const char* szDllFile) {
+  if (GetFileAttributesA(szDllFile) == INVALID_FILE_ATTRIBUTES) {
+    printf("[!] File not found: %s\n", szDllFile);
+    return false;
+  }
+  return true;
+}
+
+/// @brief Reads file content into memory buffer
+std::unique_ptr<BYTE[]> ReadFileToBuffer(const char* szDllFile,
+                                         std::streamsize& fileSize) {
+  std::ifstream file(szDllFile, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    printf("[!] Failed to open file: %s (Error: %lu)\n", szDllFile,
+           GetLastError());
+    return nullptr;
+  }
+
+  fileSize = file.tellg();
+  if (fileSize < 0x1000) {
+    printf("[!] Invalid file size: %s\n", szDllFile);
+    return std::unique_ptr<BYTE[]>();
+  }
+
+  auto buffer = std::make_unique<BYTE[]>(static_cast<size_t>(fileSize));
+  file.seekg(0, std::ios::beg);
+  file.read(reinterpret_cast<char*>(buffer.get()), fileSize);
+  return buffer;
+}
+
+/// @brief Validates PE file structure and architecture
+bool ValidatePEHeaders(BYTE* pFileData) {
+  // Check DOS header signature
+  IMAGE_DOS_HEADER* pDosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(pFileData);
+  if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+    printf("[!] Invalid DOS header.\n");
+    return false;
+  }
+
+  // Check NT headers signature
+  IMAGE_NT_HEADERS* pNtHeader =
+      reinterpret_cast<IMAGE_NT_HEADERS*>(pFileData + pDosHeader->e_lfanew);
+  if (pNtHeader->Signature != IMAGE_NT_SIGNATURE) {
+    printf("[!] Invalid NT header.\n");
+    return false;
+  }
+
+  // Check architecture compatibility
+  IMAGE_FILE_HEADER* pFileHeader = &pNtHeader->FileHeader;
+#ifdef _WIN64
+  const bool bValidArch = (pFileHeader->Machine == IMAGE_FILE_MACHINE_AMD64);
+  const char* szArch = "x64";
+#else
+  const bool bValidArch = (pFileHeader->Machine == IMAGE_FILE_MACHINE_I386);
+  const char* szArch = "x86";
+#endif
+  if (!bValidArch) {
+    printf("[!] Architecture mismatch. Expected %s.\n", szArch);
+    return false;
+  }
 
   return true;
 }
 
-#define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
-#define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
-#ifdef _WIN64
-#define RELOC_FLAG RELOC_FLAG64
-#else
-#define RELOC_FLAG RELOC_FLAG32
-#endif
+/// @brief Allocates memory in target process for DLL
+BYTE* AllocateTargetMemory(HANDLE hProcess, IMAGE_OPTIONAL_HEADER* pOptHeader) {
+  // Try to allocate at preferred base address
+  BYTE* pAllocatedMem = reinterpret_cast<BYTE*>(
+      VirtualAllocEx(hProcess, reinterpret_cast<void*>(pOptHeader->ImageBase),
+                     pOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE,
+                     PAGE_EXECUTE_READWRITE));
 
+  // Fallback to any available address
+  if (!pAllocatedMem) {
+    pAllocatedMem = reinterpret_cast<BYTE*>(
+        VirtualAllocEx(hProcess, nullptr, pOptHeader->SizeOfImage,
+                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+  }
+
+  if (!pAllocatedMem) {
+    printf("[!] Memory allocation failed (Error: %lu)\n", GetLastError());
+  }
+
+  return pAllocatedMem;
+}
+
+/// @brief Writes DLL sections to target process memory
+bool MapSectionsToTarget(HANDLE hProcess, BYTE* pTargetBase, BYTE* pFileData,
+                         IMAGE_NT_HEADERS* pOldNtHeader) {
+  // Prepare manual mapping data structure
+  MANUAL_MAPPING_DATA mmData{};
+  mmData.pLoadLibraryA = LoadLibraryA;
+  mmData.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
+
+  // Copy headers to target process
+  if (!WriteProcessMemory(hProcess, pTargetBase, pFileData, 0x1000, nullptr)) {
+    printf("[!] Header copy failed (Error: %lu)\n", GetLastError());
+    return false;
+  }
+
+  // Process each section
+  IMAGE_SECTION_HEADER* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
+  for (UINT i = 0; i < pOldNtHeader->FileHeader.NumberOfSections;
+       ++i, ++pSectionHeader) {
+    if (pSectionHeader->SizeOfRawData == 0) continue;
+
+    BYTE* pTargetSection = pTargetBase + pSectionHeader->VirtualAddress;
+    BYTE* pSourceSection = pFileData + pSectionHeader->PointerToRawData;
+
+    if (!WriteProcessMemory(hProcess, pTargetSection, pSourceSection,
+                            pSectionHeader->SizeOfRawData, nullptr)) {
+      printf("[!] Section mapping failed: %s (Error: %lu)\n",
+             pSectionHeader->Name, GetLastError());
+      return false;
+    }
+  }
+
+  // Write manual mapping data to target headers
+  memcpy(pFileData, &mmData, sizeof(mmData));
+  if (!WriteProcessMemory(hProcess, pTargetBase, pFileData, 0x1000, nullptr)) {
+    printf("[!] Mapping data write failed (Error: %lu)\n", GetLastError());
+    return false;
+  }
+
+  return true;
+}
+
+/// @brief Executes shellcode in remote process
+bool ExecuteRemoteShellcode(HANDLE hProcess, BYTE* pTargetBase) {
+  // Allocate memory for shellcode
+  void* pShellcode =
+      VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                     PAGE_EXECUTE_READWRITE);
+
+  if (!pShellcode) {
+    printf("[!] Shellcode allocation failed (Error: %lu)\n", GetLastError());
+    return false;
+  }
+
+  // Write shellcode to target
+  if (!WriteProcessMemory(hProcess, pShellcode, shell_code, 0x1000, nullptr)) {
+    printf("[!] Shellcode write failed (Error: %lu)\n", GetLastError());
+    VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+    return false;
+  }
+
+  // Create remote thread
+  HANDLE hThread =
+      CreateRemoteThread(hProcess, nullptr, 0,
+                         reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode),
+                         pTargetBase, 0, nullptr);
+
+  if (!hThread) {
+    printf("[!] Thread creation failed (Error: %lu)\n", GetLastError());
+    VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+    return false;
+  }
+
+  // Wait for module initialization
+  HINSTANCE hModule = nullptr;
+  while (!hModule) {
+    MANUAL_MAPPING_DATA mmData{};
+    if (ReadProcessMemory(hProcess, pTargetBase, &mmData, sizeof(mmData),
+                          nullptr)) {
+      hModule = mmData.hModule;
+    }
+    Sleep(10);
+  }
+
+  // Cleanup resources
+  CloseHandle(hThread);
+  VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Shellcode implementation (runs in target process)
+//-----------------------------------------------------------------------------
+
+/// @brief Shellcode executed in target process to complete DLL loading
+/// @param data_ptr Pointer to manual mapping data structure
 void __stdcall shell_code(MANUAL_MAPPING_DATA* data_ptr) {
   if (!data_ptr) return;
-  BYTE* base_ptr = reinterpret_cast<BYTE*>(data_ptr);
 
-  auto* option_ptr =
-      &reinterpret_cast<IMAGE_NT_HEADERS*>(
-           base_ptr + reinterpret_cast<IMAGE_DOS_HEADER*>(data_ptr)->e_lfanew)
-           ->OptionalHeader;
+  // Get base pointer and PE headers
+  BYTE* pBase = reinterpret_cast<BYTE*>(data_ptr);
+  IMAGE_DOS_HEADER* pDosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(data_ptr);
+  IMAGE_NT_HEADERS* pNtHeader =
+      reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + pDosHeader->e_lfanew);
+  IMAGE_OPTIONAL_HEADER* pOptHeader = &pNtHeader->OptionalHeader;
 
-  auto _LoadLibraryA = data_ptr->pLoadLibraryA;
-  auto _GetProcAddress = data_ptr->pGetProcAddress;
-  auto _DllMain = reinterpret_cast<f_DLL_ENTRY_POINT>(
-      base_ptr + option_ptr->AddressOfEntryPoint);
+  // Get critical function pointers
+  auto pLoadLibraryA = data_ptr->pLoadLibraryA;
+  auto pGetProcAddress = data_ptr->pGetProcAddress;
+  auto pDllMain = reinterpret_cast<f_DLL_ENTRY_POINT>(
+      pBase + pOptHeader->AddressOfEntryPoint);
 
-  BYTE* location_delta = base_ptr - option_ptr->ImageBase;
-  if (location_delta) {
-    if (!option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
-      return;
+  // Process relocations if needed
+  BYTE* pLocationDelta = pBase - pOptHeader->ImageBase;
+  if (pLocationDelta) {
+    ApplyRelocations(pBase, pOptHeader, pLocationDelta);
+  }
 
-    auto* reloc_data_ptr = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-        base_ptr + option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC]
-                       .VirtualAddress);
+  // Resolve imports
+  ResolveImports(pBase, pOptHeader, pLoadLibraryA, pGetProcAddress);
 
-    while (reloc_data_ptr->VirtualAddress) {
-      UINT amount_of_entries =
-          (reloc_data_ptr->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) /
-          sizeof(WORD);
+  // Execute TLS callbacks
+  ExecuteTLSCallbacks(pBase, pOptHeader);
 
-      WORD* relative_info_ptr = reinterpret_cast<WORD*>(reloc_data_ptr + 1);
+  // Call DLL entry point
+  if (pDllMain) {
+    pDllMain(reinterpret_cast<HINSTANCE>(pBase), DLL_PROCESS_ATTACH, nullptr);
+  }
 
-      for (UINT i = 0; i < amount_of_entries; i++, relative_info_ptr++) {
-        if (RELOC_FLAG(*relative_info_ptr)) {
-          UINT_PTR* patch_ptr = reinterpret_cast<UINT_PTR*>(
-              base_ptr + reloc_data_ptr->VirtualAddress +
-              ((*relative_info_ptr) & 0xFFF));
-          *patch_ptr += reinterpret_cast<UINT_PTR>(location_delta);
-        }
+  // Signal successful loading
+  data_ptr->hModule = reinterpret_cast<HINSTANCE>(pBase);
+}
+
+//-----------------------------------------------------------------------------
+// Shellcode helper functions
+//-----------------------------------------------------------------------------
+
+/// @brief Applies memory relocations
+void ApplyRelocations(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader,
+                      BYTE* pLocationDelta) {
+  if (!pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) return;
+
+  auto* pRelocBlock = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+      pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC]
+                  .VirtualAddress);
+
+  while (pRelocBlock->VirtualAddress) {
+    const UINT numEntries =
+        (pRelocBlock->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) /
+        sizeof(WORD);
+    WORD* pRelocInfo = reinterpret_cast<WORD*>(pRelocBlock + 1);
+
+    for (UINT i = 0; i < numEntries; ++i, ++pRelocInfo) {
+      if (RELOC_FLAG(*pRelocInfo)) {
+        UINT_PTR* pPatch = reinterpret_cast<UINT_PTR*>(
+            pBase + pRelocBlock->VirtualAddress + (*pRelocInfo & 0xFFF));
+        *pPatch += reinterpret_cast<UINT_PTR>(pLocationDelta);
       }
-
-      reloc_data_ptr = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-          reinterpret_cast<BYTE*>(reloc_data_ptr) +
-          reloc_data_ptr->SizeOfBlock);
     }
+
+    pRelocBlock = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+        reinterpret_cast<BYTE*>(pRelocBlock) + pRelocBlock->SizeOfBlock);
   }
+}
 
-  if (option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
-    auto* import_desc_ptr = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
-        base_ptr +
-        option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-    while (import_desc_ptr->Name) {
-      char* module_name =
-          reinterpret_cast<char*>(base_ptr + import_desc_ptr->Name);
-      HINSTANCE h_dll = _LoadLibraryA(module_name);
+/// @brief Resolves imported functions
+void ResolveImports(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader,
+                    f_LoadLibraryA pLoadLibraryA,
+                    f_GetProcAddress pGetProcAddress) {
+  if (!pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) return;
 
-      ULONG_PTR* thunk_ref_ptr = reinterpret_cast<ULONG_PTR*>(
-          base_ptr + import_desc_ptr->OriginalFirstThunk);
-      ULONG_PTR* func_ref_ptr =
-          reinterpret_cast<ULONG_PTR*>(base_ptr + import_desc_ptr->FirstThunk);
+  auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+      pBase +
+      pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 
-      if (!thunk_ref_ptr) thunk_ref_ptr = func_ref_ptr;
-      for (; *thunk_ref_ptr; thunk_ref_ptr++, func_ref_ptr++) {
-        if (IMAGE_SNAP_BY_ORDINAL(*thunk_ref_ptr)) {
-          *func_ref_ptr = _GetProcAddress(
-              h_dll, reinterpret_cast<char*>(*thunk_ref_ptr & 0xFFFF));
-        } else {
-          auto* import_by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-              base_ptr + (*thunk_ref_ptr));
-          *func_ref_ptr = _GetProcAddress(h_dll, import_by_name->Name);
-        }
+  while (pImportDesc->Name) {
+    const char* szModule =
+        reinterpret_cast<const char*>(pBase + pImportDesc->Name);
+    HINSTANCE hModule = pLoadLibraryA(szModule);
+
+    // Process function imports
+    auto pThunkRef =
+        reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->OriginalFirstThunk);
+    auto pFuncRef =
+        reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->FirstThunk);
+    pThunkRef = pThunkRef ? pThunkRef : pFuncRef;
+
+    for (; *pThunkRef; ++pThunkRef, ++pFuncRef) {
+      if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) {
+        *pFuncRef = pGetProcAddress(
+            hModule, reinterpret_cast<char*>(*pThunkRef & 0xFFFF));
+      } else {
+        auto pImport =
+            reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
+        *pFuncRef = pGetProcAddress(hModule, pImport->Name);
       }
-
-      import_desc_ptr++;
     }
+    ++pImportDesc;
   }
+}
 
-  if (option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
-    auto* tls_ptr = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(
-        base_ptr +
-        option_ptr->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-    auto* callback_ptr =
-        reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls_ptr->AddressOfCallBacks);
-    for (; callback_ptr && *callback_ptr; callback_ptr++) {
-      (*callback_ptr)(base_ptr, DLL_PROCESS_ATTACH, nullptr);
-    }
+/// @brief Executes TLS callbacks
+void ExecuteTLSCallbacks(BYTE* pBase, IMAGE_OPTIONAL_HEADER* pOptHeader) {
+  if (!pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) return;
+
+  auto* pTls = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(
+      pBase +
+      pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+
+  auto pCallback =
+      reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTls->AddressOfCallBacks);
+  for (; pCallback && *pCallback; ++pCallback) {
+    (*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
   }
-
-  if (_DllMain) {
-    _DllMain(reinterpret_cast<HINSTANCE>(base_ptr), DLL_PROCESS_ATTACH,
-             nullptr);
-  }
-
-  data_ptr->hModule = reinterpret_cast<HINSTANCE>(base_ptr);
 }

@@ -4,7 +4,9 @@ fn main() -> miette::Result<()> {
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();
-        res.set_manifest(r#"
+        res.set_resource_file("resources.rc");
+        res.set_manifest(
+            r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
 <security>
@@ -14,7 +16,8 @@ fn main() -> miette::Result<()> {
 </security>
 </trustInfo>
 </assembly>
-"#);
+"#,
+        );
         res.compile().unwrap();
     }
     let include_path = std::path::PathBuf::from("injector/include");

@@ -1,0 +1,1 @@
+MY_DLL RCDATA ".\\target\\release\\example_dll.dll"
