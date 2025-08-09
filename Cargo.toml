@@ -1,0 +1,17 @@
+[package]
+name = "mapping-injection"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+autocxx = "0.30.0"
+cxx = { version = "1.0.165", features = ["c++17"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2" , features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_Security"] }
+
+[build-dependencies]
+winres = "0.1"
+autocxx-build = "0.30.0"
+miette = { version = "5", features = ["fancy"] }
