@@ -31,6 +31,8 @@ fn main() -> miette::Result<()> {
         .includes(Path::new("injector/include"))
         .compile("mapping-injector"); // arbitrary library name, pick anything
     println!("cargo:rerun-if-changed=src/main.rs");
+    println!("cargo:rerun-if-changed=resources.rc"); // Ensure the resource file is checked for changes
+    println!("cargo:rerun-if-changed=target/release/example_dll.dll"); // Ensure the DLL is built before running this script
 
     // Add instructions to link to any C++ libraries you need.
 
